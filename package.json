@@ -1,0 +1,15 @@
+{
+  "name": "radar-agent",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Personal monitoring agent with WhatsApp delivery",
+  "main": "agent/index.js",
+  "scripts": {
+    "start": "node agent/index.js",
+    "dev": "node --watch agent/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.24.0",
+    "twilio": "^5.0.0"
+  }
+}
