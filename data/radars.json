@@ -1,0 +1,52 @@
+[
+  {
+    "id": "muse-concert",
+    "label": "Muse 演唱会",
+    "intent": "Muse 乐队新演唱会或巡演日期公布，任何城市，尤其是欧洲和英国",
+    "queries": [
+      "Muse concert tour 2025 2026 dates announced",
+      "Muse live show tickets 2026 UK Europe",
+      "Muse 演唱会 2025 2026 巡演",
+      "site:ticketmaster.com Muse 2026"
+    ],
+    "frequency": "daily",
+    "notify_threshold": "new_only",
+    "active": true,
+    "created_at": "2026-05-12T00:00:00Z",
+    "last_checked": "2026-05-12T09:49:01.949Z",
+    "last_result": "2026-05-12T09:49:01.948Z"
+  },
+  {
+    "id": "london-startup-events",
+    "label": "伦敦创业者活动",
+    "intent": "伦敦举办的创业者活动、founder meetup、pitch event、accelerator demo day，近期即将发生的",
+    "queries": [
+      "London startup founder event meetup 2026",
+      "London pitch night accelerator event upcoming",
+      "London tech entrepreneur networking event June July 2026",
+      "site:eventbrite.com London startup founder 2026"
+    ],
+    "frequency": "twice-daily",
+    "notify_threshold": "new_only",
+    "active": true,
+    "created_at": "2026-05-12T00:00:00Z",
+    "last_checked": "2026-05-12T09:50:41.183Z",
+    "last_result": "2026-05-12T09:50:41.182Z"
+  },
+  {
+    "id": "dido-concert",
+    "label": "Dido 演唱会",
+    "intent": "Dido 歌手演唱会、巡演或现场表演信息",
+    "queries": [
+      "Dido singer concert tour 2025 2026 announced",
+      "Dido live performance tickets 2026",
+      "Dido tour dates UK Europe 2026"
+    ],
+    "frequency": "weekly",
+    "notify_threshold": "new_only",
+    "active": true,
+    "created_at": "2026-05-12T00:00:00Z",
+    "last_checked": "2026-05-12T09:51:50.741Z",
+    "last_result": null
+  }
+]
