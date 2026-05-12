@@ -1,453 +1,399 @@
-// radar-agent/agent/index.js
-// Radar Agent — personal monitoring with WhatsApp delivery
-// Node.js 18+ required
+// agent/index.js
+// Radar Agent — WhatsApp 双向对话 + 定时监控
+// RUN_MODE=webhook  → 处理单条 WhatsApp 消息
+// RUN_MODE=monitor  → 定时检查所有 radar
 
 import Anthropic from "@anthropic-ai/sdk";
 import twilio from "twilio";
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, "../data");
+if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 
-// ── CONFIG ──────────────────────────────────────────────
-const CONFIG = {
-  whatsapp_to: process.env.WHATSAPP_TO,      // "whatsapp:+447700000000"
-  whatsapp_from: process.env.WHATSAPP_FROM,  // "whatsapp:+14155238886" (Twilio sandbox)
-  twilio_sid: process.env.TWILIO_SID,
-  twilio_token: process.env.TWILIO_TOKEN,
-  anthropic_key: process.env.ANTHROPIC_API_KEY,
-  max_results_per_radar: 3,
-  search_model: "claude-sonnet-4-6",
-};
+// ── 环境变量 ────────────────────────────────────────────
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const TWILIO_SID    = process.env.TWILIO_SID;
+const TWILIO_TOKEN  = process.env.TWILIO_TOKEN;
+const WA_FROM       = process.env.WHATSAPP_FROM;
+const WA_TO         = process.env.WHATSAPP_TO;
+const RUN_MODE      = process.env.RUN_MODE || "monitor";
+const MSG_FROM      = process.env.WA_FROM;    // webhook 模式：发消息的人
+const MSG_TEXT      = process.env.WA_MESSAGE; // webhook 模式：消息内容
+const BIT_APP_ID    = "radar-agent";
 
-// ── CLIENTS ─────────────────────────────────────────────
-const anthropic = new Anthropic({ apiKey: CONFIG.anthropic_key });
-const twilioClient = twilio(CONFIG.twilio_sid, CONFIG.twilio_token);
+// ── 客户端 ──────────────────────────────────────────────
+const ai   = new Anthropic({ apiKey: ANTHROPIC_KEY });
+const twil = twilio(TWILIO_SID, TWILIO_TOKEN);
 
-// ── DATA HELPERS ────────────────────────────────────────
-function dataPath(file) {
-  return join(DATA_DIR, file);
+// ── 数据读写 ─────────────────────────────────────────────
+const radarPath  = join(DATA_DIR, "radars.json");
+const resultPath = join(DATA_DIR, "results.json");
+
+function readRadars()   { return existsSync(radarPath)  ? JSON.parse(readFileSync(radarPath,  "utf8")) : []; }
+function readResults()  { return existsSync(resultPath) ? JSON.parse(readFileSync(resultPath, "utf8")) : []; }
+function saveRadars(d)  { writeFileSync(radarPath,  JSON.stringify(d, null, 2)); }
+function saveResults(d) { writeFileSync(resultPath, JSON.stringify(d, null, 2)); }
+function sleep(ms)      { return new Promise(r => setTimeout(r, ms)); }
+
+function makeId(label) {
+  return label.toLowerCase().replace(/[^\w\s]/g, "").trim()
+    .replace(/\s+/g, "-").slice(0, 30) + "-" + Date.now().toString(36);
 }
 
-function readJSON(file, fallback = []) {
-  const p = dataPath(file);
-  if (!existsSync(p)) return fallback;
-  try { return JSON.parse(readFileSync(p, "utf8")); }
-  catch { return fallback; }
+// ── WHATSAPP 发送 ────────────────────────────────────────
+async function sendWA(to, body) {
+  try {
+    await twil.messages.create({ from: WA_FROM, to, body });
+    console.log(`✓ WhatsApp → ${to}`);
+  } catch(e) {
+    console.error("WhatsApp 失败:", e.message);
+  }
 }
 
-function writeJSON(file, data) {
-  writeFileSync(dataPath(file), JSON.stringify(data, null, 2));
+// ── Bandsintown API（演唱会专用）─────────────────────────
+async function fetchBandsintown(artistName) {
+  try {
+    const encoded = encodeURIComponent(artistName);
+    const url = `https://rest.bandsintown.com/artists/${encoded}/events?app_id=${BIT_APP_ID}`;
+    const resp = await fetch(url);
+    if (!resp.ok) return [];
+    const events = await resp.json();
+    if (!Array.isArray(events)) return [];
+    return events.map(e => ({
+      source: "bandsintown",
+      title: `${artistName} · ${e.venue?.name || ""}`,
+      url: e.url || `https://bandsintown.com`,
+      date: e.datetime ? e.datetime.split("T")[0] : null,
+      location: [e.venue?.city, e.venue?.country].filter(Boolean).join(", "),
+      summary: `${artistName} 演出：${e.venue?.name || ""}，${e.venue?.city || ""}，${e.datetime?.split("T")[0] || ""}`,
+    }));
+  } catch(e) {
+    console.error("Bandsintown 失败:", e.message);
+    return [];
+  }
 }
 
-// ── SEARCH ──────────────────────────────────────────────
-async function searchWeb(query) {
-  const response = await anthropic.messages.create({
-    model: CONFIG.search_model,
-    max_tokens: 1000,
-    tools: [{ type: "web_search_20250305", name: "web_search" }],
-    messages: [{ role: "user", content: `Search for: ${query}\n\nReturn the top 5 results with title, URL, and a brief description of what each page contains.` }],
-  });
-
-  return response.content
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("\n");
-}
-
-// ── SOURCE DISCOVERY ─────────────────────────────────────
-// Run 3 discovery searches for a new radar topic, then ask Claude
-// to evaluate and pick the best official/structured sources found.
-async function discoverSources(topic) {
-  console.log(`  Discovering sources for: "${topic}"`);
-
-  const queries = [
-    `${topic} RSS feed official`,
-    `${topic} API free`,
-    `${topic} WHO CDC official site`,
-  ];
-
-  let combined = "";
-  for (const q of queries) {
-    console.log(`    → ${q}`);
+// ── Web Search（兜底）────────────────────────────────────
+async function fetchWebSearch(queries) {
+  let allText = "";
+  for (const query of queries) {
     try {
-      const result = await searchWeb(q);
-      combined += `\n\n--- Query: ${q} ---\n${result}`;
-      await new Promise((r) => setTimeout(r, 800));
-    } catch (err) {
-      console.error(`    Search failed: ${err.message}`);
+      console.log(`  搜索: ${query}`);
+      const resp = await ai.messages.create({
+        model: "claude-sonnet-4-6",
+        max_tokens: 800,
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+        messages: [{ role: "user", content: `Search: ${query}\nReturn top 5 results with title, URL, brief description.` }],
+      });
+      const text = resp.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+      allText += `\n\n--- ${query} ---\n${text}`;
+      await sleep(1200);
+    } catch(e) {
+      console.error(`  搜索失败: ${e.message}`);
     }
   }
-
-  if (!combined) return [];
-
-  const prompt = `You are helping set up a personal monitoring radar for the topic: "${topic}".
-
-The following web searches were run to find official or structured data sources (RSS feeds, APIs, official sites):
-${combined}
-
-From these results, extract up to 4 of the most useful sources for monitoring this topic. Prefer:
-1. Official RSS / Atom feeds
-2. Free public APIs
-3. Official authoritative websites (WHO, CDC, gov sites, official artist/event pages)
-4. Reliable aggregator sites with structured data
-
-For each source return:
-- name (string) — short human-readable name
-- url (string) — direct URL to the feed, API endpoint, or site
-- type (string) — one of: "rss", "api", "official_site", "aggregator"
-- description (string) — one sentence on what this source provides
-
-Return ONLY a raw JSON array (no markdown fences). Empty array [] if nothing useful found.
-Example: [{"name":"Ticketmaster Muse","url":"https://...","type":"aggregator","description":"Ticketmaster listings for Muse events."}]`;
-
-  const response = await anthropic.messages.create({
-    model: CONFIG.search_model,
-    max_tokens: 1000,
-    messages: [{ role: "user", content: prompt }],
-  });
-
-  const text = response.content.find((b) => b.type === "text")?.text || "[]";
-  const sources = repairJsonArray(text);
-  console.log(`  Found ${sources.length} source(s)`);
-  return sources;
+  return allText;
 }
 
-// ── ADD RADAR (with source discovery) ────────────────────
-async function addRadar(draft) {
-  console.log(`\n→ Adding radar: ${draft.label}`);
-
-  // Run source discovery before saving
-  const sources = await discoverSources(draft.label);
-
-  const radar = {
-    ...draft,
-    sources,                         // attach discovered sources
-    created_at: new Date().toISOString(),
-    last_checked: null,
-    last_result: null,
-  };
-
-  const radars = readJSON("radars.json");
-  radars.push(radar);
-  writeJSON("radars.json", radars);
-  console.log(`  Saved to radars.json`);
-
-  // Send WhatsApp confirmation
-  const msg = formatConfirmationMessage(radar);
-  await sendWhatsApp(msg);
-
-  return radar;
-}
-
-// ── EVALUATE RESULTS ────────────────────────────────────
-
-// Extracts complete JSON objects from a possibly-truncated array string.
-function repairJsonArray(text) {
-  const clean = text.replace(/```json|```/g, "").trim();
-
-  try {
-    const parsed = JSON.parse(clean);
-    if (Array.isArray(parsed)) return parsed;
-  } catch {}
-
-  const start = clean.indexOf("[");
-  if (start === -1) return [];
-
-  const items = [];
-  let depth = 0;
-  let objStart = -1;
-
-  for (let i = start + 1; i < clean.length; i++) {
-    const ch = clean[i];
-    if (ch === "{") {
-      if (depth === 0) objStart = i;
-      depth++;
-    } else if (ch === "}") {
-      depth--;
-      if (depth === 0 && objStart !== -1) {
-        const chunk = clean.slice(objStart, i + 1);
-        try { items.push(JSON.parse(chunk)); } catch {}
-        objStart = -1;
-      }
-    }
+// ── 选择数据源 ───────────────────────────────────────────
+async function fetchForRadar(radar) {
+  if (radar.type === "concert" && radar.artist) {
+    console.log(`  → Bandsintown: ${radar.artist}`);
+    const events = await fetchBandsintown(radar.artist);
+    if (events.length > 0) return { source: "bandsintown", events };
   }
-
-  return items;
+  console.log(`  → Web Search`);
+  const text = await fetchWebSearch(radar.queries);
+  return { source: "websearch", text };
 }
 
-async function evaluateResults(radar, searchResults, seenUrls) {
-  const prompt = `You are evaluating search results for a personal monitoring radar.
+// ── 评估结果 ─────────────────────────────────────────────
+async function evaluate(radar, fetchResult, seenUrls) {
+  if (fetchResult.source === "bandsintown") {
+    return fetchResult.events.filter(e => !seenUrls.includes(e.url));
+  }
+  if (!fetchResult.text?.trim()) return [];
 
-Radar intent: ${radar.intent}
-
-Search results:
-${searchResults}
-
-Previously seen URLs (skip these):
-${seenUrls.join("\n") || "none"}
-
-Tasks:
-1. Filter out results that don't match the intent
-2. Filter out URLs already in the "previously seen" list
-3. Filter out results that are clearly old (more than 6 months ago unless they announce future events)
-4. Return AT MOST 3 of the most relevant results. For each, extract:
-   - title (string)
-   - url (string)
-   - date (string or null — the event date, not the article date)
-   - location (string or null)
-   - summary (one sentence, in the same language as the intent)
-
-Return ONLY a raw JSON array (no markdown fences, no explanation). Empty array [] if nothing relevant.
-Example: [{"title":"Muse London O2 2026","url":"https://...","date":"2026-03-15","location":"London O2 Arena","summary":"Muse announced a London show at O2 Arena on March 15 2026."}]`;
-
-  const response = await anthropic.messages.create({
-    model: CONFIG.search_model,
+  const resp = await ai.messages.create({
+    model: "claude-sonnet-4-6",
     max_tokens: 1500,
-    messages: [{ role: "user", content: prompt }],
+    messages: [{
+      role: "user",
+      content: `评估搜索结果是否符合监控意图。
+
+意图：${radar.intent}
+
+结果：
+${fetchResult.text}
+
+已见过的 URL（跳过）：
+${seenUrls.join("\n") || "无"}
+
+只返回 JSON 数组，最多3条，格式：
+[{"title":"...","url":"...","date":"...","location":"...","summary":"一句话总结"}]
+
+没有相关新结果返回 []`
+    }]
   });
 
-  const text = response.content.find((b) => b.type === "text")?.text || "[]";
-  const items = repairJsonArray(text);
-  if (items.length === 0 && text.trim() !== "[]") {
-    console.error("Failed to parse evaluation response:", text.slice(0, 300));
-  }
-  return items;
-}
-
-// ── WHATSAPP DELIVERY ────────────────────────────────────
-async function sendWhatsApp(message) {
   try {
-    await twilioClient.messages.create({
-      from: CONFIG.whatsapp_from,
-      to: CONFIG.whatsapp_to,
-      body: message,
-    });
-    console.log("✓ WhatsApp sent");
-    return true;
-  } catch (err) {
-    console.error("WhatsApp send failed:", err.message);
-    return false;
-  }
+    const text = resp.content.find(b => b.type === "text")?.text || "[]";
+    const clean = text.replace(/```json|```/g, "").trim();
+    // 修复截断的 JSON
+    const lastBracket = clean.lastIndexOf("]");
+    const fixed = lastBracket > -1 ? clean.slice(0, lastBracket + 1) : "[]";
+    return JSON.parse(fixed);
+  } catch { return []; }
 }
 
-// ── FORMATTING HELPERS ───────────────────────────────────
-
-function frequencyLabel(f) {
-  switch (f) {
-    case "twice-daily": return "每天两次";
-    case "daily":       return "每天";
-    case "weekly":      return "每周";
-    default:            return f;
-  }
-}
-
-function formatDate(iso) {
-  if (!iso) return null;
-  try {
-    return new Date(iso).toLocaleDateString("zh-CN", {
-      year: "numeric", month: "long", day: "numeric",
-    });
-  } catch { return iso; }
-}
-
-// 1. Single result
-// 2. Multiple results
-function formatWhatsAppMessage(radar, results) {
-  const footer = `---\n_发 LIST 管理 · STOP [n] 暂停_`;
-
+// ── 格式化推送消息 ────────────────────────────────────────
+function formatAlert(radar, results) {
   if (results.length === 1) {
     const r = results[0];
-    const meta = [
-      r.date     ? `📅 ${r.date}` : null,
-      r.location ? `📍 ${r.location}` : null,
-    ].filter(Boolean).join("\n");
-
     return [
       `*🎯 ${radar.label}*`,
       ``,
       r.summary,
-      meta || null,
-      `🔗 ${r.url}`,
-      ``,
-      `_来源: 网络搜索 · ${frequencyLabel(radar.frequency)}_`,
-      footer,
-    ].filter((l) => l !== null).join("\n");
-  }
-
-  const lines = [
-    `*🎯 ${radar.label} · ${results.length}条新消息*`,
-    ``,
-  ];
-
-  results.forEach((r, i) => {
-    lines.push(`*${i + 1}.* ${r.title}`);
-    lines.push(r.summary);
-    const meta = [
       r.date     ? `📅 ${r.date}` : null,
       r.location ? `📍 ${r.location}` : null,
-    ].filter(Boolean).join(" · ");
-    if (meta) lines.push(meta);
-    lines.push(`🔗 ${r.url}`);
-    if (i < results.length - 1) lines.push(``);
+      `🔗 ${r.url}`,
+      ``,
+      `_来源: ${radar.type === "concert" ? "Bandsintown" : "网络搜索"} · 发 LIST 管理_`,
+    ].filter(l => l !== null).join("\n");
+  }
+  const lines = [`*🎯 ${radar.label} · ${results.length}条新消息*`, ``];
+  results.slice(0, 3).forEach((r, i) => {
+    lines.push(`*${i+1}.* ${r.title}`);
+    lines.push(r.summary);
+    if (r.date)     lines.push(`📅 ${r.date}`);
+    if (r.location) lines.push(`📍 ${r.location}`);
+    lines.push(`🔗 ${r.url}`, ``);
   });
-
-  lines.push(``, footer);
+  lines.push(`_发 LIST 管理 · STOP [n] 暂停_`);
   return lines.join("\n");
 }
 
-// 3. LIST command response
-function formatListMessage(radars) {
-  const lines = [`*📡 你的监控列表*`, ``];
-
-  radars.forEach((r, i) => {
-    const status = r.active ? "✅ 监控中" : "⏸ 已暂停";
-    const lastFound = r.last_result ? formatDate(r.last_result) : "暂无";
-    lines.push(`*${i + 1}.* ${r.label}`);
-    lines.push(`${status} · 网络搜索 · ${frequencyLabel(r.frequency)}`);
-    lines.push(`上次发现: ${lastFound}`);
-    if (i < radars.length - 1) lines.push(``);
-  });
-
-  lines.push(``, `---`, `_STOP [n] 暂停 · DELETE [n] 删除 · RESUME [n] 恢复_`);
-  return lines.join("\n");
-}
-
-// 4. New radar confirmation (includes discovered sources if any)
-function formatConfirmationMessage(radar) {
-  const lines = [
-    `*✓ 已添加监控*`,
-    ``,
-    `*主题:* ${radar.label}`,
-    `*来源:* 网络搜索`,
-    `*频率:* ${frequencyLabel(radar.frequency)}`,
-  ];
-
-  if (radar.sources && radar.sources.length > 0) {
-    lines.push(``, `*发现的数据源:*`);
-    radar.sources.slice(0, 3).forEach((s) => {
-      const typeIcon = { rss: "📡", api: "⚙️", official_site: "🏛", aggregator: "🔗" }[s.type] || "🔗";
-      lines.push(`${typeIcon} ${s.name}`);
-    });
-  }
-
-  lines.push(``, `有新消息直接通知你，没有消息不打扰。`);
-  return lines.join("\n");
-}
-
-// ── RUN ONE RADAR ────────────────────────────────────────
-async function runRadar(radar) {
-  console.log(`\n→ Running radar: ${radar.label}`);
-
-  const allResults = readJSON("results.json");
-  const seenUrls = allResults
-    .filter((r) => r.radar_id === radar.id && r.notified)
-    .map((r) => r.url);
-
-  let allSearchText = "";
-  for (const query of radar.queries) {
-    console.log(`  Searching: ${query}`);
-    try {
-      const result = await searchWeb(query);
-      allSearchText += `\n\n--- Query: ${query} ---\n${result}`;
-      await new Promise((r) => setTimeout(r, 1000));
-    } catch (err) {
-      console.error(`  Search failed: ${err.message}`);
-    }
-  }
-
-  if (!allSearchText) {
-    console.log("  No search results");
-    return;
-  }
-
-  console.log(`  Evaluating results…`);
-  const newResults = await evaluateResults(radar, allSearchText, seenUrls);
-  console.log(`  Found ${newResults.length} new relevant results`);
-
-  if (newResults.length === 0) {
-    updateRadarChecked(radar.id);
-    return;
-  }
-
-  const toNotify = newResults.slice(0, CONFIG.max_results_per_radar);
-  const message = formatWhatsAppMessage(radar, toNotify);
-  const sent = await sendWhatsApp(message);
-
-  const now = new Date().toISOString();
-  const savedResults = readJSON("results.json");
-
-  for (const r of toNotify) {
-    savedResults.push({
-      radar_id: radar.id,
-      found_at: now,
-      title: r.title,
-      url: r.url,
-      date: r.date || null,
-      location: r.location || null,
-      summary: r.summary,
-      notified: sent,
-    });
-  }
-
-  writeJSON("results.json", savedResults);
-  updateRadarChecked(radar.id, now);
-  console.log(`  ✓ Done — notified: ${sent}`);
-}
-
-function updateRadarChecked(radarId, lastResult = null) {
-  const radars = readJSON("radars.json");
-  const idx = radars.findIndex((r) => r.id === radarId);
-  if (idx === -1) return;
-  radars[idx].last_checked = new Date().toISOString();
-  if (lastResult) radars[idx].last_result = lastResult;
-  writeJSON("radars.json", radars);
-}
-
-// ── FREQUENCY CHECK ──────────────────────────────────────
-function shouldRunNow(radar) {
+// ── 频率判断 ─────────────────────────────────────────────
+function isDue(radar) {
   if (!radar.active) return false;
   if (!radar.last_checked) return true;
+  const hours = (Date.now() - new Date(radar.last_checked)) / 3600000;
+  return radar.frequency === "twice-daily" ? hours >= 12
+       : radar.frequency === "weekly"      ? hours >= 168
+       : hours >= 24;
+}
 
-  const hoursSince = (Date.now() - new Date(radar.last_checked)) / 1000 / 60 / 60;
+// ── 监控主循环 ───────────────────────────────────────────
+async function runMonitorCycle() {
+  console.log(`\n[${new Date().toISOString()}] 监控开始`);
+  const radars = readRadars();
+  const due = radars.filter(isDue);
+  console.log(`需要检查: ${due.length}/${radars.length}`);
 
-  switch (radar.frequency) {
-    case "twice-daily": return hoursSince >= 12;
-    case "daily":       return hoursSince >= 24;
-    case "weekly":      return hoursSince >= 168;
-    default:            return hoursSince >= 24;
+  for (const radar of due) {
+    console.log(`\n→ ${radar.label}`);
+    const seen = readResults().filter(r => r.radar_id === radar.id).map(r => r.url);
+    const fetchResult = await fetchForRadar(radar);
+    const newResults  = await evaluate(radar, fetchResult, seen);
+    console.log(`  新结果: ${newResults.length}`);
+
+    const all = readRadars();
+    const idx = all.findIndex(r => r.id === radar.id);
+    if (idx !== -1) {
+      all[idx].last_checked = new Date().toISOString();
+      if (newResults.length > 0) all[idx].last_result = new Date().toISOString();
+      saveRadars(all);
+    }
+
+    if (newResults.length === 0) { await sleep(1000); continue; }
+
+    const saved = readResults();
+    const now = new Date().toISOString();
+    newResults.forEach(r => saved.push({ radar_id: radar.id, found_at: now, ...r, notified: true }));
+    saveResults(saved);
+
+    const target = radar.owner || WA_TO;
+    await sendWA(target, formatAlert(radar, newResults.slice(0, 3)));
+    await sleep(2000);
+  }
+  console.log("监控完成");
+}
+
+// ── 解析用户指令 ─────────────────────────────────────────
+async function parseIntent(userMsg) {
+  const radars = readRadars();
+  const list = radars.map((r, i) =>
+    `${i+1}. ${r.label}（${r.type === "concert" ? "演唱会" : "搜索"}，${r.frequency}，${r.active ? "监控中" : "已暂停"}）`
+  ).join("\n") || "暂无";
+
+  const resp = await ai.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 500,
+    messages: [{
+      role: "user",
+      content: `你是监控助手指令解析器。只返回 JSON，不要其他内容。
+
+用户消息：「${userMsg}」
+当前监控列表：
+${list}
+
+判断规则：
+- 提到艺人/乐队/演唱会/巡演/concert/tour → add concert
+- 提到活动/event/meetup/新闻/消息/监控/关注 → add search  
+- LIST/列表/我的监控 → list
+- STOP+数字/暂停+数字 → stop
+- DELETE+数字/删除+数字 → delete
+- RESUME+数字/恢复+数字 → resume
+- YES/确认 → confirm
+- 其他 → help
+
+返回格式：
+新增演唱会：{"action":"add","type":"concert","label":"艺人名 演唱会","artist":"英文艺人名","intent":"监控该艺人演唱会巡演信息","queries":[],"frequency":"daily"}
+新增搜索：{"action":"add","type":"search","label":"简短名称","artist":null,"intent":"详细描述要监控的内容","queries":["英文搜索词1","英文搜索词2","中文搜索词"],"frequency":"daily"}
+查看列表：{"action":"list"}
+暂停：{"action":"stop","index":数字}
+删除：{"action":"delete","index":数字}
+恢复：{"action":"resume","index":数字}
+确认：{"action":"confirm"}
+其他：{"action":"help"}`
+    }]
+  });
+
+  try {
+    const text = resp.content.find(b => b.type === "text")?.text || "{}";
+    return JSON.parse(text.replace(/```json|```/g, "").trim());
+  } catch { return { action: "help" }; }
+}
+
+// ── 处理用户消息 ─────────────────────────────────────────
+async function handleMessage(from, msg) {
+  console.log(`← 收到消息 from ${from}: ${msg}`);
+  const intent = await parseIntent(msg);
+  console.log("意图:", JSON.stringify(intent));
+  const radars = readRadars();
+
+  switch(intent.action) {
+
+    case "add": {
+      const r = {
+        id: makeId(intent.label),
+        label: intent.label,
+        type: intent.type || "search",
+        artist: intent.artist || null,
+        intent: intent.intent,
+        queries: intent.queries || [],
+        frequency: intent.frequency || "daily",
+        active: true,
+        owner: from,
+        created_at: new Date().toISOString(),
+        last_checked: null,
+        last_result: null,
+      };
+      radars.push(r);
+      saveRadars(radars);
+
+      const src = r.type === "concert" ? "Bandsintown（实时演出数据库）" : "网络搜索";
+      const freq = { daily:"每天一次", "twice-daily":"每天两次", weekly:"每周一次" }[r.frequency] || "每天一次";
+
+      await sendWA(from,
+        `*✓ 已添加监控*\n\n` +
+        `*主题:* ${r.label}\n` +
+        `*来源:* ${src}\n` +
+        `*频率:* ${freq}\n\n` +
+        `有新消息直接通知你，没有消息不打扰。`
+      );
+      break;
+    }
+
+    case "list": {
+      if (!radars.length) {
+        await sendWA(from,
+          `*📡 暂无监控*\n\n告诉我你想监控什么：\n\n` +
+          `🎵 「监控 Muse 演唱会」\n` +
+          `📅 「关注伦敦创业者活动」\n` +
+          `📰 「追踪汉坦病毒疫情新闻」`
+        );
+        break;
+      }
+      const lines = radars.map((r, i) => {
+        const src  = r.type === "concert" ? "🎵 Bandsintown" : "🔍 搜索";
+        const freq = { daily:"每天", "twice-daily":"每天两次", weekly:"每周" }[r.frequency] || "每天";
+        const last = r.last_result ? new Date(r.last_result).toLocaleDateString("zh-CN") : "暂无";
+        return `*${i+1}.* ${r.label}\n${r.active ? "✓ 监控中" : "⏸ 已暂停"} · ${src} · ${freq}\n上次发现: ${last}`;
+      });
+      await sendWA(from,
+        `*📡 我的监控（${radars.length}个）*\n\n${lines.join("\n\n")}\n\n` +
+        `_STOP [n] 暂停 · DELETE [n] 删除 · RESUME [n] 恢复_`
+      );
+      break;
+    }
+
+    case "stop": {
+      const i = (intent.index || 1) - 1;
+      if (i >= 0 && i < radars.length) {
+        radars[i].active = false;
+        saveRadars(radars);
+        await sendWA(from, `⏸ 已暂停：*${radars[i].label}*\n\n发 RESUME ${intent.index} 恢复`);
+      } else {
+        await sendWA(from, `找不到编号 ${intent.index}，发 LIST 查看列表`);
+      }
+      break;
+    }
+
+    case "resume": {
+      const i = (intent.index || 1) - 1;
+      if (i >= 0 && i < radars.length) {
+        radars[i].active = true;
+        saveRadars(radars);
+        await sendWA(from, `✓ 已恢复：*${radars[i].label}*`);
+      }
+      break;
+    }
+
+    case "delete": {
+      const i = (intent.index || 1) - 1;
+      if (i >= 0 && i < radars.length) {
+        const label = radars[i].label;
+        radars.splice(i, 1);
+        saveRadars(radars);
+        await sendWA(from, `🗑 已删除：${label}`);
+      }
+      break;
+    }
+
+    default:
+      await sendWA(from,
+        `*👋 Radar Agent*\n\n` +
+        `告诉我你想监控什么，有新消息我会通知你。\n\n` +
+        `🎵 「监控 Muse 演唱会」\n` +
+        `📅 「关注伦敦创业者活动」\n` +
+        `📰 「追踪汉坦病毒疫情」\n` +
+        `📦 「监控 Nike 新品发布」\n\n` +
+        `_LIST 查看监控 · STOP [n] 暂停 · DELETE [n] 删除_`
+      );
   }
 }
 
-// ── MAIN ────────────────────────────────────────────────
+// ── 主入口 ───────────────────────────────────────────────
 async function main() {
-  console.log("Radar Agent starting…");
-  console.log(`Time: ${new Date().toISOString()}`);
+  console.log(`Radar Agent 启动 · 模式: ${RUN_MODE}`);
 
-  const radars = readJSON("radars.json");
-  const active = radars.filter((r) => r.active);
-  console.log(`Active radars: ${active.length}`);
-
-  if (active.length === 0) {
-    console.log("No active radars. Add some in data/radars.json");
-    return;
-  }
-
-  for (const radar of active) {
-    if (shouldRunNow(radar)) {
-      await runRadar(radar);
-      await new Promise((r) => setTimeout(r, 2000));
-    } else {
-      console.log(`→ Skipping ${radar.label} (not due yet)`);
+  if (RUN_MODE === "webhook") {
+    // 处理单条 WhatsApp 消息
+    if (!MSG_FROM || !MSG_TEXT) {
+      console.error("webhook 模式缺少 WA_FROM 或 WA_MESSAGE");
+      process.exit(1);
     }
+    console.log(`处理消息: ${MSG_FROM} → "${MSG_TEXT}"`);
+    await handleMessage(MSG_FROM, MSG_TEXT);
+    console.log("webhook 处理完成");
+  } else {
+    // 定时监控模式
+    await runMonitorCycle();
   }
-
-  console.log("\nRadar Agent complete.");
 }
 
 main().catch(console.error);
-
-// ── EXPORTS (for use by other modules / CLI) ─────────────
-export { addRadar, discoverSources, formatListMessage, formatConfirmationMessage };
